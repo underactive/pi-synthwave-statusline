@@ -113,14 +113,9 @@ function color(k: keyof typeof C, text: string): string {
 
 // ── Extension ──────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
-	// ── Session tracking ──────────────────────────
-	let sessionStartTimestamp = Date.now();
-
-	pi.on("session_start", async () => {
-		sessionStartTimestamp = Date.now();
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+
 		ctx.ui.setFooter(
 			(tui, _theme, footerData: ReadonlyFooterDataProvider) => {
 				const unsub = footerData.onBranchChange(() => tui.requestRender());
@@ -139,13 +134,13 @@ export default function (pi: ExtensionAPI) {
 						let totalCacheWrite = 0;
 						let totalCost = 0;
 
-						for (const entry of ctx.sessionManager.getEntries()) {
+						for (const entry of ctx.sessionManager?.getEntries() ?? []) {
 							if (entry.type === "message" && entry.message.role === "assistant") {
 								const m = entry.message as AssistantMessage;
 								totalInput += m.usage.input;
 								totalOutput += m.usage.output;
 								totalCacheRead += m.usage.cacheRead;
-								totalCacheWrite += m.usage.cacheWrite;
+								// totalCacheWrite intentionally omitted — no longer used in denominator
 								totalCost += m.usage.cost.total;
 							}
 						}
@@ -155,10 +150,9 @@ export default function (pi: ExtensionAPI) {
 						const contextWindow =
 							contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 						const contextPctValue = contextUsage?.percent ?? 0;
-						const contextPctStr =
-							contextUsage?.percent !== null
-								? `${Math.round(contextPctValue)}%`
-								: "?%";
+						const contextPctStr = contextUsage == null || contextUsage.percent == null
+							? "?%"
+							: `${Math.round(contextPctValue)}%`;
 
 						// Compute used abbrev like Claude: (pct/100) * window
 						const usedTokens = Math.round((contextPctValue / 100) * contextWindow);
@@ -167,8 +161,8 @@ export default function (pi: ExtensionAPI) {
 
 						const dots = generateDots(contextPctValue);
 						const labelPctColor = pctColor(contextPctValue);
-						const promptTotal = totalInput + totalCacheRead + totalCacheWrite;
-						let cacheHitStr = promptTotal > 0
+						const promptTotal = totalInput + totalCacheRead;
+						const cacheHitStr = promptTotal > 0
 							? `${color("CAC_LIGHT", ICON_CACHE_HITS)} ${color("CAC", ((totalCacheRead / promptTotal) * 100).toFixed(1) + "%")}`
 							: `${color("CAC_LIGHT", ICON_CACHE_HITS)} ${color("CAC", "-")}`;
 
@@ -185,13 +179,16 @@ export default function (pi: ExtensionAPI) {
 							pwd = "~" + pwd.slice(home.length);
 						}
 						const branch = footerData.getGitBranch();
+
+						const formatPwdLine = (path: string): string => {
+							if (branch) {
+								return `${color("CYAN_LIGHT", ICON_BRANCH)} ${color("CYAN", branch)}  ${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", path)}`;
+							}
+							return `${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", path)}`;
+						};
+
 						// ── Line 1: path with degradable subdirectory depth
-						let pwdLine = pwd;
-						if (branch) {
-							pwdLine = `${color("CYAN_LIGHT", ICON_BRANCH)} ${color("CYAN", branch)}  ${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", pwd)}`;
-						} else {
-							pwdLine = `${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", pwd)}`;
-						}
+						let pwdLine = formatPwdLine(pwd);
 
 						// Build model display with always-show components
 						const modelDisplayFinal = provider
@@ -208,12 +205,7 @@ export default function (pi: ExtensionAPI) {
 								// Remove the leftmost (highest) directory
 								dirParts.shift();
 								const trimmedPath = dirParts.length === 1 ? dirParts[0] : (dirParts[0] === "~" ? "~/" + dirParts.slice(1).join("/") : dirParts.join("/"));
-								let trimmedPwd;
-								if (branch) {
-									trimmedPwd = `${color("CYAN_LIGHT", ICON_BRANCH)} ${color("CYAN", branch)}  ${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", trimmedPath)}`;
-								} else {
-									trimmedPwd = `${color("YELLOW_LIGHT", ICON_FOLDER)} ${color("YELLOW", trimmedPath)}`;
-								}
+								const trimmedPwd = formatPwdLine(trimmedPath);
 								const testLine = trimmedPwd + "  " + modelBlock;
 								if (visibleWidth(testLine) <= width) {
 									pwdLine = trimmedPwd;
@@ -243,11 +235,9 @@ export default function (pi: ExtensionAPI) {
 						];
 						// Right block: cost (always) + cache hits + cache reads (degradable right-to-left)
 						const rightSegments: { text: string; width: number }[] = [];
-						// Rightmost in right block = most expendable (closest to edge)
-						if (cacheHitStr) {
-							rightSegments.push({ text: cacheHitStr, width: 0 });
-						}
+						// Leftmost in right block = most expendable (closest to gap), cost always shown
 						rightSegments.push({ text: `${color("CAC_LIGHT", ICON_CACHE_READS)} ${color("CAC", formatTokens(totalCacheRead))}`, width: 0 });
+						rightSegments.push({ text: cacheHitStr, width: 0 });
 						rightSegments.push({ text: `${color("GREEN_LIGHT", ICON_COST)}${color("GREEN", costFmt)}`, width: 0 });
 
 						const sep = " ";
@@ -310,7 +300,7 @@ export default function (pi: ExtensionAPI) {
 						// Extension statuses on line 3 if space
 						const extStatuses = footerData.getExtensionStatuses();
 						if (extStatuses.size > 0) {
-							const sorted = Array.from(extStatuses as Map<string, string>)
+							const sorted = Array.from(extStatuses)
 								.sort((a, b) => a[0].localeCompare(b[0]))
 								.map(([, t]) => t);
 							lines.push(truncateToWidth(sorted.join(" "), width, "..."));
