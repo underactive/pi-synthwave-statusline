@@ -54,6 +54,10 @@ ORANGE: "\x1b[38;2;255;139;57m", // burnt orange (thinking level) — Synthwave 
 
 	// Icons
 	ICO: "\x1b[38;2;255;255;255m", // white (stat icons)
+
+	// Tokens/sec — synthwave bright yellow
+	TPS: "\x1b[38;2;254;222;93m", // sunset yellow (matches YELLOW)
+	TPS_ICON: "\x1b[38;2;214;182;53m", // dim sunset yellow for the ⚡ icon
 } as const;
 
 // ── Nerd Font icons (decoded from ~/.claude/statusline-command.sh printf escapes) ──
@@ -116,8 +120,54 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
 
+		// Clean up any lingering debounce timer on session end
+		pi.on("session_shutdown", () => {
+			if (tpsDebounceTimer) {
+				clearTimeout(tpsDebounceTimer);
+				tpsDebounceTimer = null;
+			}
+		});
+
+		// ── Streaming state for live tokens/sec ────────────────────
+		let isStreaming = false;
+		let streamStartTime = 0;
+		let streamOutputTokens = 0;
+		let tpsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+		let requestFooterRender: (() => void) | null = null;
+
+		pi.on("turn_start", () => {
+			if (tpsDebounceTimer) {
+				clearTimeout(tpsDebounceTimer);
+				tpsDebounceTimer = null;
+			}
+			isStreaming = true;
+			streamStartTime = Date.now();
+			streamOutputTokens = 0;
+		});
+
+		pi.on("turn_end", () => {
+			isStreaming = false;
+			// Keep tps visible for 2s after streaming stops, then hide
+			tpsDebounceTimer = setTimeout(() => {
+				tpsDebounceTimer = null;
+				requestFooterRender?.();
+			}, 2000);
+			requestFooterRender?.();
+		});
+
+		pi.on("message_update", (event) => {
+			if (!isStreaming) return;
+			// Count streaming deltas as they arrive; usage.output is only finalized at message_end
+			const ev = event.assistantMessageEvent;
+			if (ev.type === "text_delta" || ev.type === "thinking_delta") {
+				streamOutputTokens += ev.delta.split(/\s+/).filter(Boolean).length;
+			}
+			requestFooterRender?.();
+		});
+
 		ctx.ui.setFooter(
 			(tui, _theme, footerData: ReadonlyFooterDataProvider) => {
+				requestFooterRender = () => tui.requestRender();
 				const unsub = footerData.onBranchChange(() => tui.requestRender());
 
 				return {
@@ -221,21 +271,33 @@ export default function (pi: ExtensionAPI) {
 							: truncateToWidth(pwdLine + "  " + modelBlock, width, "...");
 
 						// ── Line 2: two-column layout with priority degradation ─────
-						// Left block: context icon + progress bar + percentage + ratio + tokens
+						// Left block: context icon + progress bar + percentage + ratio + tokens + tps
 						const leftSegments: { text: string; width: number }[] = [
 							// Rightmost in left block = most important (closest to gap)
-							// Visual order: context icon, progress bar, percentage, ratio, tokens in, tokens out
-							// Hide priority (loop adds from end): tokens out ← tokens in ← ratio ← pct ← bar ← icon
+							// Visual order: context icon, progress bar, percentage, ratio, tokens in, tokens out, ⚡ t/s
+							// Hide priority (loop adds from end): tps ← tokens out ← tokens in ← ratio ← pct ← bar ← icon
 							{ text: color("CTX", "\u{F0AF0}\u{F0B01}\u{F0B05}"), width: 0 },
 							{ text: dots, width: 0 },
 							{ text: `${labelPctColor}${contextPctStr}${C.RESET}`, width: 0 },
 							{ text: color("TOK", `(${usedAbbrev} / ${windowAbbrev})`), width: 0 },
 							{ text: `${color("TOK_LIGHT", ICON_INPUT)} ${color("TOK", formatTokens(totalInput))}`, width: 0 },
 							{ text: `${color("TOK_LIGHT", ICON_OUTPUT)} ${color("TOK", formatTokens(totalOutput))}`, width: 0 },
+							// ── Live tokens/sec (during streaming + 2s debounce) ──
+							// Inline IIFE — returns empty string when hidden, so it consumes no space
+							{ text: (() => {
+								if (!(isStreaming || tpsDebounceTimer !== null) || streamOutputTokens <= 0) return "";
+								const elapsedMs = Date.now() - streamStartTime;
+								const seconds = elapsedMs / 1000;
+								const tps = seconds > 0
+									? (streamOutputTokens / seconds).toFixed(0)
+									: "?";
+								return `${color("TPS_ICON", "\u26A1")}${color("TPS", `${tps} t/s`)}`;
+							})(), width: 0 },
 						];
-						// Right block: cost (always) + cache hits + cache reads (degradable right-to-left)
+
+						// Right block: cache reads + cache hits + cost
+						// Degradation order (leftmost first = most expendable): cache reads ← cache hits, cost always shown
 						const rightSegments: { text: string; width: number }[] = [];
-						// Leftmost in right block = most expendable (closest to gap), cost always shown
 						rightSegments.push({ text: `${color("CAC_LIGHT", ICON_CACHE_READS)} ${color("CAC", formatTokens(totalCacheRead))}`, width: 0 });
 						rightSegments.push({ text: cacheHitStr, width: 0 });
 						rightSegments.push({ text: `${color("GREEN_LIGHT", ICON_COST)}${color("GREEN", costFmt)}`, width: 0 });
