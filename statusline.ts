@@ -60,6 +60,15 @@ ORANGE: "\x1b[38;2;255;139;57m", // burnt orange (thinking level) — Synthwave 
 	TPS_ICON: "\x1b[38;2;214;182;53m", // dim sunset yellow for the ⚡ icon
 } as const;
 
+// ── Shimmer effect constants (Codex-style light sweep) ──────
+const SHIMMER_INTERVAL = 80;          // ms (~12.5fps)
+const SHIMMER_CYCLES = 3;             // number of full L→R sweeps before stopping
+const SHIMMER_SWEEP_S = 2.0;          // seconds per full L→R sweep
+const SHIMMER_BAND_HALF = 5.0;        // half-width of highlight band in chars
+const SHIMMER_PADDING = 10;           // extra sweep padding so band enters/exits smoothly
+const SHIMMER_BASE: [number, number, number] = [255, 0, 255];       // magenta (model text)
+const SHIMMER_HIGHLIGHT: [number, number, number] = [155, 252, 250]; // light cyan (sweep band)
+
 // ── Nerd Font icons (decoded from ~/.claude/statusline-command.sh printf escapes) ──
 const ICON_BRANCH = "\u{E725}"; //  (devicon: git-branch)
 const ICON_INPUT = "\u{F103}"; //  (bash: \xEF\x84\x83)
@@ -72,6 +81,8 @@ const ICON_COST = "\u{F155}"; //  (bash: \xEF\x85\x95)
 
 // ── Context dot progress bar ───────────────────────────────────
 const NUM_DOTS = 20;
+const CONTEXT_YELLOW_THRESHOLD = 40;
+const CONTEXT_RED_THRESHOLD = 70;
 
 function generateDots(percent: number): string {
 	const filled = Math.min(NUM_DOTS, Math.max(0, Math.round((percent * NUM_DOTS) / 100)));
@@ -86,19 +97,19 @@ function generateDots(percent: number): string {
 // ── Helpers ────────────────────────────────────────────────────
 
 /** Color for a segment at position i (0-indexed) out of NUM_DOTS.
- *  <50% white, 50-84% yellow, 85%+ red
+ *  <yellow threshold = white, yellow threshold to <red threshold = yellow, red threshold+ = red
  */
 function segColor(pos: number, total: number): string {
 	const segPct = ((pos + 1) / total) * 100;
-	if (segPct >= 85) return "\x1b[38;2;254;68;80m"; // neon red (Synthwave 84)
-	if (segPct >= 50) return "\x1b[93m"; // bright yellow
+	if (segPct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;254;68;80m"; // neon red (Synthwave 84)
+	if (segPct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[93m"; // bright yellow
 	return C.CTX;
 }
 
 /** Color for the overall percentage label */
 function pctColor(pct: number): string {
-	if (pct >= 85) return "\x1b[38;2;254;68;80m";
-	if (pct >= 50) return "\x1b[93m";
+	if (pct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;254;68;80m";
+	if (pct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[93m";
 	return C.CTX;
 }
 
@@ -114,10 +125,34 @@ function color(k: keyof typeof C, text: string): string {
 	return `${C[k]}${text}${C.RESET}`;
 }
 
+/** Codex-style light-sweep shimmer: a cosine-falloff highlight band sweeps L→R across text */
+function shimmerString(text: string, elapsedMs: number): string {
+	const chars = [...text];
+	if (chars.length === 0) return "";
+	const period = chars.length + SHIMMER_PADDING * 2;
+	const elapsedS = elapsedMs / 1000;
+	const pos = ((elapsedS % SHIMMER_SWEEP_S) / SHIMMER_SWEEP_S) * period;
+
+	return chars
+		.map((ch, i) => {
+			const dist = Math.abs((i + SHIMMER_PADDING) - pos);
+			const t = dist <= SHIMMER_BAND_HALF
+				? 0.5 * (1 + Math.cos(Math.PI * dist / SHIMMER_BAND_HALF))
+				: 0;
+			const alpha = t * 0.9;
+			const r = Math.round(SHIMMER_HIGHLIGHT[0] * alpha + SHIMMER_BASE[0] * (1 - alpha));
+			const g = Math.round(SHIMMER_HIGHLIGHT[1] * alpha + SHIMMER_BASE[1] * (1 - alpha));
+			const b = Math.round(SHIMMER_HIGHLIGHT[2] * alpha + SHIMMER_BASE[2] * (1 - alpha));
+			const bold = t > 0.2 ? "\x1b[1m" : "";
+			return `${bold}\x1b[38;2;${r};${g};${b}m${ch}\x1b[22m`;
+		})
+		.join("") + C.RESET;
+}
+
 
 // ── Extension ──────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		if (!ctx.hasUI) return;
 
 		// Clean up any lingering debounce timer on session end
@@ -125,6 +160,10 @@ export default function (pi: ExtensionAPI) {
 			if (tpsDebounceTimer) {
 				clearTimeout(tpsDebounceTimer);
 				tpsDebounceTimer = null;
+			}
+			if (shimmerTimer) {
+				clearInterval(shimmerTimer);
+				shimmerTimer = null;
 			}
 		});
 
@@ -134,6 +173,28 @@ export default function (pi: ExtensionAPI) {
 		let streamOutputTokens = 0;
 		let tpsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 		let requestFooterRender: (() => void) | null = null;
+
+		// ── Shimmer state for model name animation ─────────────
+		let shimmerActiveSince = 0;
+		let shimmerTimer: ReturnType<typeof setInterval> | null = null;
+
+		/** (Re)start the shimmer sweep — called from setFooter init and model_select */
+		const startShimmer = () => {
+			shimmerActiveSince = Date.now();
+			if (shimmerTimer) clearInterval(shimmerTimer);
+			shimmerTimer = setInterval(() => {
+				const elapsed = Date.now() - shimmerActiveSince;
+				if (elapsed > SHIMMER_CYCLES * SHIMMER_SWEEP_S * 1000) {
+					clearInterval(shimmerTimer!);
+					shimmerTimer = null;
+				}
+				requestFooterRender?.();
+			}, SHIMMER_INTERVAL);
+		};
+
+		pi.on("model_select", () => {
+			startShimmer();
+		});
 
 		pi.on("turn_start", () => {
 			if (tpsDebounceTimer) {
@@ -170,8 +231,19 @@ export default function (pi: ExtensionAPI) {
 				requestFooterRender = () => tui.requestRender();
 				const unsub = footerData.onBranchChange(() => tui.requestRender());
 
+				// Start shimmer effect for model name on /new and /reload only
+				if (event.reason === "new" || event.reason === "startup" || event.reason === "reload") {
+					startShimmer();
+				}
+
 				return {
-					dispose: unsub,
+					dispose: () => {
+						unsub();
+						if (shimmerTimer) {
+							clearInterval(shimmerTimer);
+							shimmerTimer = null;
+						}
+					},
 					invalidate() {
 						// no-op: render() reads sessionManager directly
 					},
@@ -241,9 +313,14 @@ export default function (pi: ExtensionAPI) {
 						let pwdLine = formatPwdLine(pwd);
 
 						// Build model display with always-show components
-						const modelDisplayFinal = provider
-							? `${color("MAGENTA_LIGHT", `(${provider})`)} ${color("MAGENTA", modelId)}`
-							: color("MAGENTA", modelId);
+						const modelRawText = provider ? `(${provider}) ${modelId}` : modelId;
+						const isShimmering = shimmerTimer !== null;
+						const elapsed = Date.now() - shimmerActiveSince;
+						const modelDisplayFinal = isShimmering
+							? shimmerString(modelRawText, elapsed)
+							: (provider
+								? `${color("MAGENTA_LIGHT", `(${provider})`)} ${color("MAGENTA", modelId)}`
+								: color("MAGENTA", modelId));
 						const modelBlock = `${modelDisplayFinal}  ${color("ORANGE_LIGHT", "\u{E28C}")} ${color("ORANGE", " " + pi.getThinkingLevel())}`;
 
 						// Right-align model block on line 1
