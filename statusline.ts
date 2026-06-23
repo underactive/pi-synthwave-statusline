@@ -101,15 +101,15 @@ function generateDots(percent: number): string {
  */
 function segColor(pos: number, total: number): string {
 	const segPct = ((pos + 1) / total) * 100;
-	if (segPct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;254;68;80m"; // neon red (Synthwave 84)
-	if (segPct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[93m"; // bright yellow
+	if (segPct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;255;105;180m"; // hot pink (Synthwave 84)
+	if (segPct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[38;2;54;249;246m"; // electric cyan (Synthwave 84)
 	return C.CTX;
 }
 
 /** Color for the overall percentage label */
 function pctColor(pct: number): string {
-	if (pct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;254;68;80m";
-	if (pct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[93m";
+	if (pct >= CONTEXT_RED_THRESHOLD) return "\x1b[38;2;255;105;180m";
+	if (pct >= CONTEXT_YELLOW_THRESHOLD) return "\x1b[38;2;54;249;246m";
 	return C.CTX;
 }
 
@@ -165,6 +165,7 @@ export default function (pi: ExtensionAPI) {
 				clearInterval(shimmerTimer);
 				shimmerTimer = null;
 			}
+
 		});
 
 		// ── Streaming state for live tokens/sec ────────────────────
@@ -177,6 +178,7 @@ export default function (pi: ExtensionAPI) {
 		// ── Shimmer state for model name animation ─────────────
 		let shimmerActiveSince = 0;
 		let shimmerTimer: ReturnType<typeof setInterval> | null = null;
+
 
 		/** (Re)start the shimmer sweep — called from setFooter init and model_select */
 		const startShimmer = () => {
@@ -232,9 +234,10 @@ export default function (pi: ExtensionAPI) {
 				const unsub = footerData.onBranchChange(() => tui.requestRender());
 
 				// Start shimmer effect for model name on /new and /reload only
-				if (event.reason === "new" || event.reason === "startup" || event.reason === "reload") {
+				if (event.reason === "new" || event.reason === "reload") {
 					startShimmer();
 				}
+
 
 				return {
 					dispose: () => {
