@@ -1,49 +1,63 @@
-# jojo-statusline
+# pi-synthwave-statusline
 
-A Pi extension that replaces the default footer with a **Claude Code–inspired statusline**,
-featuring the context dot progress bar and pipe-separated column layout.
+![screenshot](screenshot.png)
 
-## Layout
+A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that replaces the default statusline with a Synthwave 84–themed footer.
 
-```
-Line 1:  main  ~/dev/project                        ← branch icon + dir (Claude-style)
-Line 2: context: ●●○○○○○○○○○○○○   5% |  55k   212  󰮆 4k  󰃨 50k  | 0.90  󰔟 42h23m18s  󱂛 2m28s  | (provider) model · used / window · Pi v0.79.4
-```
+## Features
 
-### Columns
+### Two-line status footer
 
-| Column | Content | Colors |
-|--------|---------|--------|
-| Context bar | `context: ●●○○○` + ` 5%` | Soft yellow dots (filled), dim (empty), bright cyan % |
-| Tokens / cache | ` input   output  󰮆 cache-writes  󰃨 cache-reads` | Blue icons+values, hot pink cache |
-| Cost + times | `$cost  󰔟 session-time  󱂛 api-time` | Green cost, pastel orange session, lime API time |
-| Model info | `(provider) model · used / window · Pi vX` | Magenta model, blue context, orange version |
+**Line 1 — Navigation & Model**
+- Git branch and working directory with adaptive path trimming
+- Active model and provider with thinking level indicator
+- Codex-style shimmer animation on model name (triggers on `/new`, `/reload`, and model change)
 
-### Differences from Claude statusline
+**Line 2 — Context & Token Stats**
+- Context usage progress bar with color-coded thresholds:
+  - **White** — under 40% usage
+  - **Electric cyan** — 40–69% usage
+  - **Hot pink** — 70%+ usage
+- Context percentage and used/total token ratio
+- Input and output token counts
+- Live tokens/sec during streaming (with 2s debounce after streaming stops)
+- Cache read tokens and cache hit ratio
+- Session cost
 
-| Claude feature | Status |
-|---------------|--------|
-| Context dot bar (13 dots) | ✅ Ported |
-| Token + cache stats in pipe col | ✅ Ported |
-| Cost + session/API time in pipe col | ✅ Ported |
-| Model info with context window | ✅ Ported |
-| Pi version | ✅ Added (replaces "Claude X") |
-| Provider prefix | ✅ Added `(provider) model` |
-| Current / weekly rate limit bars | ❌ Removed |
-| Effort level | ❌ Removed |
-| Output style | ❌ Removed |
-| Git staged/modified counts | ❌ Removed |
+**Line 3 — Extension statuses** (shown when other extensions report status)
 
-## Install
+### Color palette
+
+All colors are drawn from the Synthwave 84 palette:
+- Electric cyan for branch names and context mid-range
+- Sunset yellow for directory paths
+- Neon green for cost
+- Bright magenta for model name
+- Hot pink for cache stats and context high-range
+- Burnt orange for thinking level
+- Blue for token counts
+
+### Adaptive layout
+
+Segments degrade gracefully when the terminal is too narrow — least important segments are hidden first, keeping the most critical information visible.
+
+## Requirements
+
+- **[Pi](https://github.com/earendil-works/pi-coding-agent)** — the CLI coding agent this extension is built for
+- **[Nerd Font](https://www.nerdfonts.com/)** — required for status icons (git branch, folder, tokens, cache, cost). Any patched Nerd Font works (e.g. JetBrainsMono Nerd Font, FiraCode Nerd Font, etc.)
+- **True color terminal** — the extension uses 24-bit RGB ANSI escape codes (`\x1b[38;2;R;G;Bm`). Most modern terminals support this (iTerm2, Kitty, Alacritty, WezTerm, Windows Terminal, Ghostty)
+
+## Installation
+
+Copy or symlink `statusline.ts` into your Pi extensions directory:
 
 ```bash
-ln -sf "$(pwd)/.pi/extensions/index.ts" ~/.pi/agent/extensions/pi-jojo-statusline.ts
+# macOS / Linux
+cp statusline.ts ~/.pi/extensions/statusline.ts
 ```
 
-`/reload` Pi to activate.
+The extension activates automatically on the next Pi session.
 
-## Uninstall
+## Author
 
-```bash
-rm ~/.pi/agent/extensions/pi-jojo-statusline.ts && /reload
-```
+Eric Sison
