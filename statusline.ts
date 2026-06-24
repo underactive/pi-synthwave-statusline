@@ -18,7 +18,10 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ReadonlyFooterDataProvider,
+	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import type { EditorTheme, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ── Claude-ported ANSI colors ──────────────────────────────────
@@ -69,6 +72,16 @@ const SHIMMER_PADDING = 10;           // extra sweep padding so band enters/exit
 const SHIMMER_BASE: [number, number, number] = [255, 0, 255];       // magenta (model text)
 const SHIMMER_HIGHLIGHT: [number, number, number] = [155, 252, 250]; // light cyan (sweep band)
 
+// ── Compaction progress constants ─────────────────────────────
+const COMPACT_INTERVAL = 80;          // ms (~12.5fps)
+const COMPACT_COMPLETE_MS = 400;      // ms to show 100% before clearing
+const COMPACT_MIN_ESTIMATE_MS = 8_000;
+const COMPACT_MAX_ESTIMATE_MS = 120_000;
+const COMPACT_PROGRESS_CAP = 95;      // asymptotic cap until session_compact
+const COMPACT_PRE_PHASE_CAP = 5;      // fake progress cap while waiting for session_before_compact
+const COMPACT_PRE_ESTIMATE_MS = 90_000; // slow ease toward 5% during manual /compact prep
+const COMPACT_PRE_MAX_WAIT_MS = 120_000;  // stop pre-phase if session_before_compact never arrives
+
 // ── Nerd Font icons (decoded from ~/.claude/statusline-command.sh printf escapes) ──
 const ICON_BRANCH = "\u{E725}"; //  (devicon: git-branch)
 const ICON_INPUT = "\u{F103}"; //  (bash: \xEF\x84\x83)
@@ -92,6 +105,67 @@ function generateDots(percent: number): string {
 	for (let i = filled; i < NUM_DOTS; i++) bar += "\u2591"; // ░
 	bar += C.RESET;
 	return bar;
+}
+
+/** Magenta compaction bar — distinct from context usage thresholds */
+function generateCompactionDots(percent: number): string {
+	const filled = Math.min(NUM_DOTS, Math.max(0, Math.round((percent * NUM_DOTS) / 100)));
+	let bar = "";
+	for (let i = 0; i < filled; i++) bar += C.MAGENTA + "\u258b";
+	bar += C.RESET + "\x1b[2m";
+	for (let i = filled; i < NUM_DOTS; i++) bar += "\u2591";
+	bar += C.RESET;
+	return bar;
+}
+
+function estimateCompactionMs(preparation: SessionBeforeCompactEvent["preparation"]): number {
+	const msgCount = preparation.messagesToSummarize.length + preparation.turnPrefixMessages.length;
+	const parallelFactor = preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0 ? 1.35 : 1;
+	return Math.min(
+		COMPACT_MAX_ESTIMATE_MS,
+		Math.max(COMPACT_MIN_ESTIMATE_MS, (5_000 + msgCount * 400) * parallelFactor),
+	);
+}
+
+/** Eased progress toward cap — real completion arrives via session_compact */
+function compactionProgress(elapsedMs: number, estimatedMs: number, cap = COMPACT_PROGRESS_CAP): number {
+	const t = 1 - Math.exp(-elapsedMs / (estimatedMs / 2.5));
+	return Math.min(cap, Math.max(0, Math.round(t * cap)));
+}
+
+function preCompactionProgress(elapsedMs: number): number {
+	return compactionProgress(elapsedMs, COMPACT_PRE_ESTIMATE_MS, COMPACT_PRE_PHASE_CAP);
+}
+
+function isManualCompactCommand(text: string): boolean {
+	const trimmed = text.trim();
+	return trimmed === "/compact" || trimmed.startsWith("/compact ");
+}
+
+/** Intercept /compact on Enter submit — Editor.onSubmit is a class field, so setter wrapping does not work */
+class CompactAwareEditor extends CustomEditor {
+	private onCompactSubmit: () => void;
+
+	constructor(
+		tui: TUI,
+		theme: EditorTheme,
+		keybindings: KeybindingsManager,
+		onCompactSubmit: () => void,
+	) {
+		super(tui, theme, keybindings);
+		this.onCompactSubmit = onCompactSubmit;
+	}
+
+	override handleInput(data: string): void {
+		if (
+			!this.disableSubmit
+			&& this.keybindings.matches(data, "tui.input.submit")
+			&& isManualCompactCommand(this.getText())
+		) {
+			this.onCompactSubmit();
+		}
+		super.handleInput(data);
+	}
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -155,19 +229,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		if (!ctx.hasUI) return;
 
-		// Clean up any lingering debounce timer on session end
-		pi.on("session_shutdown", () => {
-			if (tpsDebounceTimer) {
-				clearTimeout(tpsDebounceTimer);
-				tpsDebounceTimer = null;
-			}
-			if (shimmerTimer) {
-				clearInterval(shimmerTimer);
-				shimmerTimer = null;
-			}
-
-		});
-
 		// ── Streaming state for live tokens/sec ────────────────────
 		let isStreaming = false;
 		let streamStartTime = 0;
@@ -179,6 +240,155 @@ export default function (pi: ExtensionAPI) {
 		let shimmerActiveSince = 0;
 		let shimmerTimer: ReturnType<typeof setInterval> | null = null;
 
+		// ── Compaction progress state ───────────────────────────
+		let isCompacting = false;
+		let compactionStartMs = 0;
+		let compactionEstimatedMs = COMPACT_MIN_ESTIMATE_MS;
+		let compactionPct = 0;
+		let compactionTimer: ReturnType<typeof setInterval> | null = null;
+		let compactionCompleteTimer: ReturnType<typeof setTimeout> | null = null;
+		let compactionAbortCleanup: (() => void) | null = null;
+
+		const stopCompactionProgress = () => {
+			if (compactionTimer) {
+				clearInterval(compactionTimer);
+				compactionTimer = null;
+			}
+			if (compactionCompleteTimer) {
+				clearTimeout(compactionCompleteTimer);
+				compactionCompleteTimer = null;
+			}
+			if (compactionAbortCleanup) {
+				compactionAbortCleanup();
+				compactionAbortCleanup = null;
+			}
+			isCompacting = false;
+			compactionPct = 0;
+		};
+
+		const startPreCompactionProgress = () => {
+			const entries = ctx.sessionManager?.getEntries() ?? [];
+			const messageCount = entries.filter((e) => e.type === "message").length;
+			if (messageCount < 2) return;
+			// Already in main compaction phase (past the 5% pre-phase)
+			if (isCompacting && compactionPct > COMPACT_PRE_PHASE_CAP) return;
+			// Already showing pre-phase progress
+			if (isCompacting && compactionPct <= COMPACT_PRE_PHASE_CAP) return;
+
+			if (compactionTimer) {
+				clearInterval(compactionTimer);
+				compactionTimer = null;
+			}
+			if (compactionCompleteTimer) {
+				clearTimeout(compactionCompleteTimer);
+				compactionCompleteTimer = null;
+			}
+			if (compactionAbortCleanup) {
+				compactionAbortCleanup();
+				compactionAbortCleanup = null;
+			}
+
+			isCompacting = true;
+			compactionStartMs = Date.now();
+			compactionEstimatedMs = COMPACT_PRE_ESTIMATE_MS;
+			compactionPct = 0;
+			compactionTimer = setInterval(() => {
+				const elapsed = Date.now() - compactionStartMs;
+				if (elapsed > COMPACT_PRE_MAX_WAIT_MS) {
+					stopCompactionProgress();
+					requestFooterRender?.();
+					return;
+				}
+				compactionPct = preCompactionProgress(elapsed);
+				requestFooterRender?.();
+			}, COMPACT_INTERVAL);
+			requestFooterRender?.();
+		};
+
+		const finishCompactionProgress = () => {
+			if (compactionTimer) {
+				clearInterval(compactionTimer);
+				compactionTimer = null;
+			}
+			if (compactionAbortCleanup) {
+				compactionAbortCleanup();
+				compactionAbortCleanup = null;
+			}
+			isCompacting = true;
+			compactionPct = 100;
+			requestFooterRender?.();
+			compactionCompleteTimer = setTimeout(() => {
+				compactionCompleteTimer = null;
+				stopCompactionProgress();
+				requestFooterRender?.();
+			}, COMPACT_COMPLETE_MS);
+		};
+
+		const startCompactionProgress = (preparation: SessionBeforeCompactEvent["preparation"]) => {
+			const carriedPct = isCompacting ? compactionPct : 0;
+			if (compactionTimer) {
+				clearInterval(compactionTimer);
+				compactionTimer = null;
+			}
+			if (compactionCompleteTimer) {
+				clearTimeout(compactionCompleteTimer);
+				compactionCompleteTimer = null;
+			}
+			isCompacting = true;
+			compactionStartMs = Date.now();
+			compactionEstimatedMs = estimateCompactionMs(preparation);
+			compactionPct = carriedPct;
+			compactionTimer = setInterval(() => {
+				const elapsed = Date.now() - compactionStartMs;
+				const mainPct = compactionProgress(elapsed, compactionEstimatedMs);
+				compactionPct = Math.max(carriedPct, mainPct);
+				requestFooterRender?.();
+			}, COMPACT_INTERVAL);
+			requestFooterRender?.();
+		};
+
+		pi.on("session_before_compact", async (event: SessionBeforeCompactEvent) => {
+			startCompactionProgress(event.preparation);
+			const onAbort = () => {
+				stopCompactionProgress();
+				requestFooterRender?.();
+			};
+			event.signal.addEventListener("abort", onAbort);
+			compactionAbortCleanup = () => event.signal.removeEventListener("abort", onAbort);
+		});
+
+		if (ctx.mode === "tui") {
+			ctx.ui.setEditorComponent((tui, theme, keybindings) =>
+				new CompactAwareEditor(tui, theme, keybindings, startPreCompactionProgress),
+			);
+		}
+
+		pi.on("input", async (event) => {
+			if (isManualCompactCommand(event.text)) startPreCompactionProgress();
+		});
+
+		const originalCompact = ctx.compact.bind(ctx);
+		ctx.compact = (options) => {
+			startPreCompactionProgress();
+			originalCompact(options);
+		};
+
+		pi.on("session_compact", async () => {
+			finishCompactionProgress();
+		});
+
+		pi.on("session_shutdown", () => {
+			if (tpsDebounceTimer) {
+				clearTimeout(tpsDebounceTimer);
+				tpsDebounceTimer = null;
+			}
+			if (shimmerTimer) {
+				clearInterval(shimmerTimer);
+				shimmerTimer = null;
+			}
+			ctx.ui.setEditorComponent(undefined);
+			stopCompactionProgress();
+		});
 
 		/** (Re)start the shimmer sweep — called from setFooter init and model_select */
 		const startShimmer = () => {
@@ -246,6 +456,7 @@ export default function (pi: ExtensionAPI) {
 							clearInterval(shimmerTimer);
 							shimmerTimer = null;
 						}
+						stopCompactionProgress();
 					},
 					invalidate() {
 						// no-op: render() reads sessionManager directly
@@ -350,7 +561,20 @@ export default function (pi: ExtensionAPI) {
 							? pwdLine + " ".repeat(pwdGap) + modelBlock
 							: truncateToWidth(pwdLine + "  " + modelBlock, width, "...");
 
-						// ── Line 2: two-column layout with priority degradation ─────
+						// ── Line 2: context stats, or compaction progress when active ─
+						let line2: string;
+						if (isCompacting) {
+							const compactBar = generateCompactionDots(compactionPct);
+							const compactLeft = `${color("MAGENTA_LIGHT", "Compacting")}  ${compactBar}  ${color("MAGENTA", `${compactionPct}%`)}`;
+							const costBlock = `${color("GREEN_LIGHT", ICON_COST)}${color("GREEN", costFmt)}`;
+							const compactLeftWidth = visibleWidth(compactLeft);
+							const costWidth = visibleWidth(costBlock);
+							if (compactLeftWidth + costWidth + 2 <= width) {
+								line2 = compactLeft + " ".repeat(width - compactLeftWidth - costWidth) + costBlock;
+							} else {
+								line2 = truncateToWidth(compactLeft, width, "...");
+							}
+						} else {
 						// Left block: context icon + progress bar + percentage + ratio + tokens + tps
 						const leftSegments: { text: string; width: number }[] = [
 							// Rightmost in left block = most important (closest to gap)
@@ -429,12 +653,12 @@ export default function (pi: ExtensionAPI) {
 						const rightBlockWidth = visibleWidth(rightBlock);
 
 						const combined = leftBlockWidth + rightBlockWidth;
-						let line2: string;
 						if (rightBlockWidth > 0) {
 							const pad = combined <= width ? width - combined : 0;
 							line2 = leftBlock + " ".repeat(pad) + rightBlock;
 						} else {
 							line2 = leftBlock + " ".repeat(width - leftBlockWidth);
+						}
 						}
 
 						const lines: string[] = [line1, line2];
