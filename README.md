@@ -26,6 +26,16 @@ A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that replace
 
 **Line 3 — Extension statuses** (shown when other extensions report status)
 
+### Compaction progress
+
+When you run `/compact`, line 2 switches from context stats to a magenta compaction progress bar:
+
+![compaction progress](screenshot-compact-progress.png)
+
+- **Pre-phase** — starts immediately on `/compact` submit; eases exponentially to 5% over 15 seconds, then holds at 5% while Pi prepares
+- **Main phase** — continues from the pre-phase percentage once compaction begins, easing toward 95% based on session size
+- **Complete** — jumps to 100% when compaction finishes, then clears after a brief flash
+
 ### Color palette
 
 All colors are drawn from the Synthwave 84 palette:
