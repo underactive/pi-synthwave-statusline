@@ -20,7 +20,8 @@ import type {
 	ReadonlyFooterDataProvider,
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { CustomEditor, estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -79,7 +80,7 @@ const COMPACT_MIN_ESTIMATE_MS = 8_000;
 const COMPACT_MAX_ESTIMATE_MS = 120_000;
 const COMPACT_PROGRESS_CAP = 95;      // asymptotic cap until session_compact
 const COMPACT_PRE_PHASE_CAP = 5;      // fake progress cap while waiting for session_before_compact
-const COMPACT_PRE_ESTIMATE_MS = 90_000; // slow ease toward 5% during manual /compact prep
+const COMPACT_PRE_ESTIMATE_MS = 15_000; // exponential ease toward 5%, then hold until main phase
 const COMPACT_PRE_MAX_WAIT_MS = 120_000;  // stop pre-phase if session_before_compact never arrives
 
 // ── Nerd Font icons (decoded from ~/.claude/statusline-command.sh printf escapes) ──
@@ -134,12 +135,57 @@ function compactionProgress(elapsedMs: number, estimatedMs: number, cap = COMPAC
 }
 
 function preCompactionProgress(elapsedMs: number): number {
+	if (elapsedMs >= COMPACT_PRE_ESTIMATE_MS) return COMPACT_PRE_PHASE_CAP;
 	return compactionProgress(elapsedMs, COMPACT_PRE_ESTIMATE_MS, COMPACT_PRE_PHASE_CAP);
 }
 
 function isManualCompactCommand(text: string): boolean {
 	const trimmed = text.trim();
 	return trimmed === "/compact" || trimmed.startsWith("/compact ");
+}
+
+/** Sum chars/4 heuristic over session messages — matches pi's estimatedTokensAfter after compaction */
+function estimateMessagesTokenCount(messages: AgentMessage[]): number {
+	let tokens = 0;
+	for (const message of messages) {
+		tokens += estimateTokens(message);
+	}
+	return tokens;
+}
+
+interface ResolvedContextUsage {
+	percent: number;
+	tokens: number;
+	contextWindow: number;
+	isEstimated: boolean;
+}
+
+/** Authoritative usage when available; otherwise estimate from branch messages (post-compaction gap). */
+function resolveContextUsage(ctx: {
+	getContextUsage(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+	model?: { contextWindow: number } | null;
+	sessionManager: { buildSessionContext(): { messages: AgentMessage[] } };
+}, streamingTokenBonus = 0): ResolvedContextUsage {
+	const contextUsage = ctx.getContextUsage();
+	const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+
+	if (contextUsage?.percent != null && contextUsage.tokens != null) {
+		return {
+			percent: contextUsage.percent,
+			tokens: contextUsage.tokens,
+			contextWindow,
+			isEstimated: false,
+		};
+	}
+
+	if (contextWindow <= 0) {
+		return { percent: 0, tokens: 0, contextWindow, isEstimated: false };
+	}
+
+	const { messages } = ctx.sessionManager.buildSessionContext();
+	const tokens = estimateMessagesTokenCount(messages) + streamingTokenBonus;
+	const percent = Math.min(100, (tokens / contextWindow) * 100);
+	return { tokens, percent, contextWindow, isEstimated: true };
 }
 
 /** Intercept /compact on Enter submit — Editor.onSubmit is a class field, so setter wrapping does not work */
@@ -483,15 +529,17 @@ export default function (pi: ExtensionAPI) {
 
 						// ── Context usage ──────────────────────────
 						const contextUsage = ctx.getContextUsage();
-						const contextWindow =
-							contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-						const contextPctValue = contextUsage?.percent ?? 0;
-						const contextPctStr = contextUsage == null || contextUsage.percent == null
-							? "?%"
-							: `${Math.round(contextPctValue)}%`;
+						const streamingBonus = contextUsage?.percent == null && (isStreaming || tpsDebounceTimer !== null)
+							? streamOutputTokens
+							: 0;
+						const resolvedContext = resolveContextUsage(ctx, streamingBonus);
+						const contextPctValue = resolvedContext.percent;
+						const contextWindow = resolvedContext.contextWindow;
+						const contextPctStr = `${Math.round(contextPctValue)}%`;
 
-						// Compute used abbrev like Claude: (pct/100) * window
-						const usedTokens = Math.round((contextPctValue / 100) * contextWindow);
+						const usedTokens = resolvedContext.isEstimated
+							? resolvedContext.tokens
+							: Math.round((contextPctValue / 100) * contextWindow);
 						const usedAbbrev = formatTokens(usedTokens);
 						const windowAbbrev = formatTokens(contextWindow);
 
